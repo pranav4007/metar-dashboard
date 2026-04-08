@@ -14,16 +14,18 @@ app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "metar-secret-key")
 CORS(app)
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode="eventlet")
 
-STATIONS = ["VIAH", "VIDP", "VIBY", "VIAG", "VIND"]
-DB_PATH = os.environ.get("DB_PATH", "/tmp/metar_history.db")
+STATIONS    = ["VIAH", "VIDP", "VIBY", "VIAG", "VIND"]
+DB_PATH     = os.environ.get("DB_PATH", "/tmp/metar_history.db")
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "300"))
 
-# ── Database ──────────────────────────────────────────────────────────────────
+latest_metars = {}
+_started = False   # guard against double-init
+
+# ── DB ────────────────────────────────────────────────────────────────────────
 
 def init_db():
     conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("""
+    conn.execute("""
         CREATE TABLE IF NOT EXISTS metar_history (
             id         INTEGER PRIMARY KEY AUTOINCREMENT,
             station    TEXT    NOT NULL,
@@ -34,33 +36,32 @@ def init_db():
     conn.commit()
     conn.close()
 
-def save_metar(station, raw, fetched_at):
+def save_metar(station, raw, ts):
     conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT raw FROM metar_history WHERE station=? ORDER BY id DESC LIMIT 1", (station,))
-    row = c.fetchone()
+    row = conn.execute(
+        "SELECT raw FROM metar_history WHERE station=? ORDER BY id DESC LIMIT 1",
+        (station,)
+    ).fetchone()
     changed = row is None or row[0] != raw
     if changed:
-        c.execute("INSERT INTO metar_history (station, raw, fetched_at) VALUES (?,?,?)",
-                  (station, raw, fetched_at))
+        conn.execute(
+            "INSERT INTO metar_history(station,raw,fetched_at) VALUES(?,?,?)",
+            (station, raw, ts)
+        )
         conn.commit()
     conn.close()
     return changed
 
 def get_history(station, limit=50):
     conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute(
-        "SELECT raw, fetched_at FROM metar_history WHERE station=? ORDER BY id DESC LIMIT ?",
+    rows = conn.execute(
+        "SELECT raw,fetched_at FROM metar_history WHERE station=? ORDER BY id DESC LIMIT ?",
         (station, limit)
-    )
-    rows = c.fetchall()
+    ).fetchall()
     conn.close()
     return [{"raw": r[0], "fetched_at": r[1]} for r in rows]
 
-# ── METAR fetching ────────────────────────────────────────────────────────────
-
-latest_metars = {}
+# ── METAR ─────────────────────────────────────────────────────────────────────
 
 def fetch_metar(station):
     try:
@@ -72,38 +73,41 @@ def fetch_metar(station):
         return None
 
 def poll_loop():
-    # Initial fetch on startup
-    print("[POLL] Initial fetch...")
+    print("[POLL] Starting initial fetch...")
     for s in STATIONS:
         raw = fetch_metar(s)
         if raw:
             now = int(time.time())
             save_metar(s, raw, now)
             latest_metars[s] = {"raw": raw, "fetched_at": now}
-            socketio.emit("metar_update", {
-                "station": s, "raw": raw, "fetched_at": now, "changed": True
-            })
-            print(f"[STARTUP] {s}: OK")
+            socketio.emit("metar_update",
+                {"station": s, "raw": raw, "fetched_at": now, "changed": True})
+            print(f"[INIT] {s}: OK")
         eventlet.sleep(1)
 
-    # Continuous polling loop
     while True:
         eventlet.sleep(POLL_INTERVAL)
+        print("[POLL] Polling all stations...")
         for station in STATIONS:
             raw = fetch_metar(station)
-            now = int(time.time())
             if raw:
+                now = int(time.time())
                 changed = save_metar(station, raw, now)
                 latest_metars[station] = {"raw": raw, "fetched_at": now}
-                socketio.emit("metar_update", {
-                    "station": station, "raw": raw,
-                    "fetched_at": now, "changed": changed
-                })
-                print(f"[POLL] {station}: {'NEW' if changed else 'same'}")
+                socketio.emit("metar_update",
+                    {"station": station, "raw": raw, "fetched_at": now, "changed": changed})
+                print(f"[POLL] {station}: {'CHANGED' if changed else 'same'}")
             eventlet.sleep(2)
-        print(f"[POLL] Cycle done. Next in {POLL_INTERVAL}s")
 
-# ── API ───────────────────────────────────────────────────────────────────────
+# ── Routes ────────────────────────────────────────────────────────────────────
+
+@app.route("/")
+def index():
+    return render_template("index.html")
+
+@app.route("/api/health")
+def health():
+    return jsonify({"ok": True, "stations": list(latest_metars.keys()), "ts": int(time.time())})
 
 @app.route("/api/latest")
 def api_latest():
@@ -111,34 +115,32 @@ def api_latest():
 
 @app.route("/api/latest/<station>")
 def api_latest_station(station):
-    station = station.upper()
-    if station in latest_metars:
-        return jsonify(latest_metars[station])
-    return jsonify({"error": "Not fetched yet, please wait"}), 202
+    d = latest_metars.get(station.upper())
+    if d:
+        return jsonify(d)
+    return jsonify({"error": "not ready yet"}), 202
 
 @app.route("/api/history/<station>")
 def api_history(station):
-    station = station.upper()
     limit = min(int(request.args.get("limit", 50)), 200)
-    return jsonify(get_history(station, limit))
+    return jsonify(get_history(station.upper(), limit))
 
-@app.route("/api/health")
-def health():
-    return jsonify({"status": "ok", "timestamp": int(time.time()),
-                    "stations_loaded": list(latest_metars.keys())})
+# ── Bootstrap (runs once when module is first imported by any server) ─────────
 
-@app.route("/")
-def index():
-    return render_template("index.html")
+def bootstrap():
+    global _started
+    if _started:
+        return
+    _started = True
+    init_db()
+    socketio.start_background_task(poll_loop)
+    print("[BOOT] DB ready, poll task started.")
 
-# ── Init (runs regardless of how the server is started) ──────────────────────
+bootstrap()
 
-init_db()
-socketio.start_background_task(poll_loop)
-
-# ── Dev entry point ───────────────────────────────────────────────────────────
+# ── Dev runner ────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    print(f"[STARTUP] Server on :{port}")
-    socketio.run(app, host="0.0.0.0", port=port)
+    print(f"[MAIN] Listening on 0.0.0.0:{port}")
+    socketio.run(app, host="0.0.0.0", port=port, log_output=True)

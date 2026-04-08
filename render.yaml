@@ -9,7 +9,7 @@ services:
       - key: SECRET_KEY
         generateValue: true
       - key: PORT
-        value: 10000
+        value: 5000
       - key: POLL_INTERVAL
         value: 300
       - key: DB_PATH
