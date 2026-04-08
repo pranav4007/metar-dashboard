@@ -8,7 +8,7 @@ from flask_cors import CORS
 import avwx
 
 app = Flask(__name__, static_folder="static", template_folder="templates")
-app.config["SECRET_KEY"] = os.environ.get("71cad267b678677801d1499b3dd10f5e", "metar-secret-key")
+app.config["71cad267b678677801d1499b3dd10f5e"] = os.environ.get("71cad267b678677801d1499b3dd10f5e", "71cad267b678677801d1499b3dd10f5e")
 CORS(app)
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode="eventlet")
 
