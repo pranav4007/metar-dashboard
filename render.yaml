@@ -9,6 +9,6 @@ services:
       - key: 71cad267b678677801d1499b3dd10f5e
         generateValue: true
       - key: POLL_INTERVAL
-        value: 300
+        value: 500
       - key: DB_PATH
         value: /tmp/metar_history.db
