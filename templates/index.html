@@ -716,15 +716,29 @@ function buildHistoryTabs() {
 
 // ─── DATA FETCH (initial REST) ────────────────────────────────────────────
 async function fetchInitialData() {
-  try {
-    const res = await fetch("/api/latest");
-    const data = await res.json();
-    Object.entries(data).forEach(([st, info]) => {
-      updateStation(st, info.raw, info.fetched_at, false);
-    });
-  } catch(e) {
-    console.warn("Initial fetch failed:", e);
-  }
+  // Retry every 5s until the server has data (startup fetch may still be running)
+  const attempt = async () => {
+    try {
+      const res = await fetch("/api/latest");
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      const keys = Object.keys(data);
+      if (keys.length === 0) {
+        // Server started but poll hasn't finished yet — retry
+        setTimeout(attempt, 5000);
+        return;
+      }
+      keys.forEach(st => {
+        updateStation(st, data[st].raw, data[st].fetched_at, false);
+      });
+      // Also reload history for default tab
+      loadHistory(historyStation);
+    } catch(e) {
+      console.warn("Initial fetch failed, retrying:", e);
+      setTimeout(attempt, 5000);
+    }
+  };
+  attempt();
 }
 
 // ─── WEBSOCKET ────────────────────────────────────────────────────────────
@@ -859,12 +873,16 @@ async function requestNotifPermission() {
 
 // ─── HISTORY ─────────────────────────────────────────────────────────────
 async function loadHistory(station) {
+  const tbody = document.getElementById("history-body");
   try {
     const res = await fetch(`/api/history/${station}?limit=50`);
+    if (!res.ok) {
+      tbody.innerHTML = `<tr><td colspan="2" style="color:var(--dim);text-align:center;padding:16px;">Waiting for server... (${res.status})</td></tr>`;
+      return;
+    }
     const rows = await res.json();
-    const tbody = document.getElementById("history-body");
-    if (!rows.length) {
-      tbody.innerHTML = `<tr><td colspan="2" style="color:var(--dim);text-align:center;padding:16px;">No history yet</td></tr>`;
+    if (!Array.isArray(rows) || rows.length === 0) {
+      tbody.innerHTML = `<tr><td colspan="2" style="color:var(--dim);text-align:center;padding:16px;">No history yet for ${station}</td></tr>`;
       return;
     }
     tbody.innerHTML = rows.map(r => {
@@ -877,6 +895,7 @@ async function loadHistory(station) {
     }).join("");
   } catch(e) {
     console.warn("History fetch failed:", e);
+    tbody.innerHTML = `<tr><td colspan="2" style="color:var(--dim);text-align:center;padding:16px;">Could not load history</td></tr>`;
   }
 }
 
