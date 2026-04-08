@@ -26,6 +26,7 @@ def init_db():
         station TEXT NOT NULL, raw TEXT NOT NULL, fetched_at INTEGER NOT NULL
     )""")
     conn.commit(); conn.close()
+    print("[DB] Ready", flush=True)
 
 def save_metar(station, raw, ts):
     conn = sqlite3.connect(DB_PATH)
@@ -49,40 +50,63 @@ def get_history(station, limit=50):
 
 # ── METAR ─────────────────────────────────────────────────────────────────────
 
-def fetch_metar(station):
+def fetch_one(station):
     try:
         m = avwx.Metar(station)
         m.update()
-        return m.raw
+        raw = m.raw
+        if raw:
+            now = int(time.time())
+            save_metar(station, raw, now)
+            latest_metars[station] = {"raw": raw, "fetched_at": now}
+            socketio.emit("metar_update", {
+                "station": station, "raw": raw, "fetched_at": now,
+                "changed": True
+            })
+            print(f"[FETCH] {station}: {raw[:60]}", flush=True)
+        return raw
     except Exception as e:
         print(f"[ERROR] {station}: {e}", flush=True)
         return None
 
 def poll_loop():
-    print("[POLL] Initial fetch starting...", flush=True)
+    # Initial fetch — one station at a time, emit as each comes in
+    print("[POLL] Initial fetch...", flush=True)
     for s in STATIONS:
-        raw = fetch_metar(s)
-        if raw:
-            now = int(time.time())
-            save_metar(s, raw, now)
-            latest_metars[s] = {"raw": raw, "fetched_at": now}
-            socketio.emit("metar_update", {"station": s, "raw": raw, "fetched_at": now, "changed": True})
-            print(f"[INIT] {s}: OK", flush=True)
-        else:
-            print(f"[INIT] {s}: FAILED", flush=True)
-        eventlet.sleep(2)
-    print("[POLL] Initial done. Looping...", flush=True)
+        fetch_one(s)
+        eventlet.sleep(1)
+    print("[POLL] Initial complete.", flush=True)
+
+    # Continuous loop
     while True:
         eventlet.sleep(POLL_INTERVAL)
-        for station in STATIONS:
-            raw = fetch_metar(station)
-            if raw:
-                now = int(time.time())
-                changed = save_metar(station, raw, now)
-                latest_metars[station] = {"raw": raw, "fetched_at": now}
-                socketio.emit("metar_update", {"station": station, "raw": raw, "fetched_at": now, "changed": changed})
-                print(f"[POLL] {station}: {'NEW' if changed else 'same'}", flush=True)
+        print("[POLL] Refresh cycle...", flush=True)
+        for s in STATIONS:
+            try:
+                m = avwx.Metar(s)
+                m.update()
+                raw = m.raw
+                if raw:
+                    now = int(time.time())
+                    changed = save_metar(s, raw, now)
+                    latest_metars[s] = {"raw": raw, "fetched_at": now}
+                    socketio.emit("metar_update", {
+                        "station": s, "raw": raw, "fetched_at": now, "changed": changed
+                    })
+                    print(f"[POLL] {s}: {'NEW' if changed else 'same'}", flush=True)
+            except Exception as e:
+                print(f"[ERROR] {s}: {e}", flush=True)
             eventlet.sleep(2)
+
+# ── WebSocket — push all current data to newly connected client ───────────────
+
+@socketio.on("connect")
+def on_connect():
+    print(f"[WS] Client connected, pushing {len(latest_metars)} stations", flush=True)
+    for s, d in latest_metars.items():
+        socketio.emit("metar_update", {
+            "station": s, "raw": d["raw"], "fetched_at": d["fetched_at"], "changed": False
+        }, to=request.sid)
 
 # ── Routes ────────────────────────────────────────────────────────────────────
 
@@ -108,12 +132,12 @@ def api_history(station):
     limit = min(int(request.args.get("limit", 50)), 200)
     return jsonify(get_history(station.upper(), limit))
 
-# ── Start — called at module level so it runs whether imported or run directly ─
+# ── Boot ──────────────────────────────────────────────────────────────────────
 
-print("[BOOT] Initialising...", flush=True)
+print("[BOOT] Starting up...", flush=True)
 init_db()
 socketio.start_background_task(poll_loop)
-print("[BOOT] Poll task queued. Starting server...", flush=True)
+print("[BOOT] Poll task started.", flush=True)
 
 port = int(os.environ.get("PORT", 10000))
 socketio.run(app, host="0.0.0.0", port=port, log_output=True)
