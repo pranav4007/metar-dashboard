@@ -716,26 +716,30 @@ function buildHistoryTabs() {
 
 // ─── DATA FETCH (initial REST) ────────────────────────────────────────────
 async function fetchInitialData() {
-  // Retry every 5s until the server has data (startup fetch may still be running)
+  let attempts = 0;
   const attempt = async () => {
+    attempts++;
     try {
       const res = await fetch("/api/latest");
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      if (!res.ok) {
+        console.warn(`/api/latest returned ${res.status}, retry ${attempts}`);
+        setTimeout(attempt, 6000);
+        return;
+      }
       const data = await res.json();
       const keys = Object.keys(data);
       if (keys.length === 0) {
-        // Server started but poll hasn't finished yet — retry
+        // Server booted but initial METAR fetch still running (~10-15s)
+        const vEl = document.getElementById("viah-raw");
+        if (vEl) vEl.innerHTML = `<span class="loading">FETCHING DATA (${attempts})<span class="blink">_</span></span>`;
         setTimeout(attempt, 5000);
         return;
       }
-      keys.forEach(st => {
-        updateStation(st, data[st].raw, data[st].fetched_at, false);
-      });
-      // Also reload history for default tab
+      keys.forEach(st => updateStation(st, data[st].raw, data[st].fetched_at, false));
       loadHistory(historyStation);
     } catch(e) {
-      console.warn("Initial fetch failed, retrying:", e);
-      setTimeout(attempt, 5000);
+      console.warn("fetchInitialData error, retry", attempts, e);
+      setTimeout(attempt, 6000);
     }
   };
   attempt();
