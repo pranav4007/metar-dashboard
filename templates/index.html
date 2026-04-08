@@ -606,7 +606,7 @@ const STATION_NAMES = {
   VIDP: "Delhi Indira Gandhi Intl",
   VIBY: "Bareilly",
   VIAG: "Agra",
-  VIND: "Hindon"
+  VIND: "Jewar Intl (Noida)"
 };
 
 // Aligarh coordinates
@@ -717,28 +717,49 @@ function buildHistoryTabs() {
 // ─── DATA FETCH (initial REST) ────────────────────────────────────────────
 async function fetchInitialData() {
   let attempts = 0;
+  const allStations = ["VIAH", ...SECONDARY];
+
+  const setAllLoading = (msg) => {
+    allStations.forEach(st => {
+      const el = document.getElementById(`${st}-raw`);
+      if (el && (el.querySelector(".loading") || el.textContent.trim() === "")) {
+        el.innerHTML = `<span class="loading">${msg}<span class="blink">_</span></span>`;
+      }
+    });
+  };
+
   const attempt = async () => {
     attempts++;
     try {
       const res = await fetch("/api/latest");
       if (!res.ok) {
-        console.warn(`/api/latest returned ${res.status}, retry ${attempts}`);
+        setAllLoading(`SERVER ERROR ${res.status} — RETRY ${attempts}`);
         setTimeout(attempt, 6000);
         return;
       }
       const data = await res.json();
       const keys = Object.keys(data);
       if (keys.length === 0) {
-        // Server booted but initial METAR fetch still running (~10-15s)
-        const vEl = document.getElementById("viah-raw");
-        if (vEl) vEl.innerHTML = `<span class="loading">FETCHING DATA (${attempts})<span class="blink">_</span></span>`;
+        setAllLoading(`FETCHING METAR ${attempts}`);
         setTimeout(attempt, 5000);
         return;
       }
+      // Update whatever stations came back
       keys.forEach(st => updateStation(st, data[st].raw, data[st].fetched_at, false));
-      loadHistory(historyStation);
+      // If some stations still missing, retry for them
+      const missing = allStations.filter(st => !data[st]);
+      if (missing.length > 0) {
+        missing.forEach(st => {
+          const el = document.getElementById(`${st}-raw`);
+          if (el) el.innerHTML = `<span class="loading">FETCHING<span class="blink">_</span></span>`;
+        });
+        setTimeout(attempt, 5000);
+      } else {
+        loadHistory(historyStation);
+      }
     } catch(e) {
       console.warn("fetchInitialData error, retry", attempts, e);
+      setAllLoading(`CONNECTING — RETRY ${attempts}`);
       setTimeout(attempt, 6000);
     }
   };
