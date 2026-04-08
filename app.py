@@ -1,6 +1,8 @@
+import eventlet
+eventlet.monkey_patch()
+
 import os
 import time
-import threading
 import sqlite3
 from flask import Flask, jsonify, render_template, request
 from flask_socketio import SocketIO
@@ -10,7 +12,7 @@ import avwx
 app = Flask(__name__, static_folder="static", template_folder="templates")
 app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "metar-secret-key")
 CORS(app)
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode="eventlet")
 
 STATIONS = ["VIAH", "VIDP", "VIBY", "VIAG", "VIND"]
 DB_PATH = os.environ.get("DB_PATH", "/tmp/metar_history.db")
@@ -75,9 +77,9 @@ def poll_loop():
                 latest_metars[station] = {"raw": raw, "fetched_at": now}
                 socketio.emit("metar_update", {"station": station, "raw": raw, "fetched_at": now, "changed": changed})
                 print(f"[POLL] {station}: {'NEW' if changed else 'same'}")
-            time.sleep(2)
+            eventlet.sleep(2)
         print(f"[POLL] Cycle done. Sleeping {POLL_INTERVAL}s")
-        time.sleep(POLL_INTERVAL)
+        eventlet.sleep(POLL_INTERVAL)
 
 # ── API ───────────────────────────────────────────────────────────────────────
 
@@ -125,7 +127,7 @@ if __name__ == "__main__":
             latest_metars[s] = {"raw": raw, "fetched_at": now}
             print(f"[STARTUP] {s}: OK")
 
-    threading.Thread(target=poll_loop, daemon=True).start()
+    socketio.start_background_task(poll_loop)
     port = int(os.environ.get("PORT", 5000))
     print(f"[STARTUP] Server on :{port}")
-    socketio.run(app, host="0.0.0.0", port=port, allow_unsafe_werkzeug=True)
+    socketio.run(app, host="0.0.0.0", port=port)
