@@ -715,63 +715,51 @@ function buildHistoryTabs() {
 }
 
 // ─── DATA FETCH (initial REST) ────────────────────────────────────────────
+// REST fallback — polls /api/latest until all 5 stations are populated
 async function fetchInitialData() {
-  let attempts = 0;
   const allStations = ["VIAH", ...SECONDARY];
-
-  const setAllLoading = (msg) => {
-    allStations.forEach(st => {
-      const el = document.getElementById(`${st}-raw`);
-      if (el && (el.querySelector(".loading") || el.textContent.trim() === "")) {
-        el.innerHTML = `<span class="loading">${msg}<span class="blink">_</span></span>`;
-      }
-    });
-  };
+  let attempts = 0;
 
   const attempt = async () => {
     attempts++;
     try {
       const res = await fetch("/api/latest");
-      if (!res.ok) {
-        setAllLoading(`SERVER ERROR ${res.status} — RETRY ${attempts}`);
-        setTimeout(attempt, 6000);
-        return;
-      }
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
-      const keys = Object.keys(data);
-      if (keys.length === 0) {
-        setAllLoading(`FETCHING METAR ${attempts}`);
-        setTimeout(attempt, 5000);
-        return;
-      }
-      // Update whatever stations came back
-      keys.forEach(st => updateStation(st, data[st].raw, data[st].fetched_at, false));
-      // If some stations still missing, retry for them
+      Object.keys(data).forEach(st => updateStation(st, data[st].raw, data[st].fetched_at, false));
       const missing = allStations.filter(st => !data[st]);
       if (missing.length > 0) {
+        // Update loading text with counter so user knows it's working
         missing.forEach(st => {
           const el = document.getElementById(`${st}-raw`);
-          if (el) el.innerHTML = `<span class="loading">FETCHING<span class="blink">_</span></span>`;
+          if (el) el.innerHTML =
+            `<span class="loading">FETCHING METAR ${attempts}<span class="blink">_</span></span>`;
         });
-        setTimeout(attempt, 5000);
+        setTimeout(attempt, 4000);
       } else {
         loadHistory(historyStation);
       }
     } catch(e) {
-      console.warn("fetchInitialData error, retry", attempts, e);
-      setAllLoading(`CONNECTING — RETRY ${attempts}`);
-      setTimeout(attempt, 6000);
+      ["VIAH", ...SECONDARY].forEach(st => {
+        const el = document.getElementById(`${st}-raw`);
+        if (el && el.querySelector(".loading"))
+          el.innerHTML = `<span class="loading">CONNECTING ${attempts}<span class="blink">_</span></span>`;
+      });
+      setTimeout(attempt, 5000);
     }
   };
   attempt();
 }
 
 // ─── WEBSOCKET ────────────────────────────────────────────────────────────
+// Server pushes all current METARs on connect, so we get data immediately
+// even if the REST poll hasn't returned yet.
 function connectSocket() {
-  const socket = io({ transports: ["websocket","polling"] });
+  const socket = io({ transports: ["websocket", "polling"] });
 
   socket.on("connect", () => {
     setConnStatus(true);
+    console.log("[WS] Connected — server will push current METARs");
   });
 
   socket.on("disconnect", () => {
@@ -780,10 +768,11 @@ function connectSocket() {
 
   socket.on("metar_update", (payload) => {
     updateStation(payload.station, payload.raw, payload.fetched_at, payload.changed);
+    // Only alert for genuine new METAR (not the on-connect snapshot)
     if (payload.station === "VIAH" && payload.changed) {
       triggerVIAHAlert(payload.raw);
     }
-    if (historyStation === payload.station) {
+    if (historyStation === payload.station && payload.changed) {
       loadHistory(payload.station);
     }
   });
