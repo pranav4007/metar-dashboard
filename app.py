@@ -14,12 +14,10 @@ app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "metar-secret-key")
 CORS(app)
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode="eventlet")
 
-STATIONS    = ["VIAH", "VIDP", "VIBY", "VIAG", "VIND"]
-DB_PATH     = os.environ.get("DB_PATH", "/tmp/metar_history.db")
+STATIONS      = ["VIAH", "VIDP", "VIBY", "VIAG", "VIND"]
+DB_PATH       = os.environ.get("DB_PATH", "/tmp/metar_history.db")
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "300"))
-
 latest_metars = {}
-_started = False   # guard against double-init
 
 # ── DB ────────────────────────────────────────────────────────────────────────
 
@@ -27,14 +25,15 @@ def init_db():
     conn = sqlite3.connect(DB_PATH)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS metar_history (
-            id         INTEGER PRIMARY KEY AUTOINCREMENT,
-            station    TEXT    NOT NULL,
-            raw        TEXT    NOT NULL,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            station TEXT NOT NULL,
+            raw TEXT NOT NULL,
             fetched_at INTEGER NOT NULL
         )
     """)
     conn.commit()
     conn.close()
+    print(f"[DB] Ready: {DB_PATH}")
 
 def save_metar(station, raw, ts):
     conn = sqlite3.connect(DB_PATH)
@@ -73,7 +72,7 @@ def fetch_metar(station):
         return None
 
 def poll_loop():
-    print("[POLL] Starting initial fetch...")
+    print("[POLL] Starting initial fetch of all stations...")
     for s in STATIONS:
         raw = fetch_metar(s)
         if raw:
@@ -82,12 +81,14 @@ def poll_loop():
             latest_metars[s] = {"raw": raw, "fetched_at": now}
             socketio.emit("metar_update",
                 {"station": s, "raw": raw, "fetched_at": now, "changed": True})
-            print(f"[INIT] {s}: OK")
-        eventlet.sleep(1)
+            print(f"[INIT] {s}: OK — {raw[:60]}")
+        else:
+            print(f"[INIT] {s}: FAILED (no data returned)")
+        eventlet.sleep(2)
 
+    print(f"[POLL] Initial done. Looping every {POLL_INTERVAL}s...")
     while True:
         eventlet.sleep(POLL_INTERVAL)
-        print("[POLL] Polling all stations...")
         for station in STATIONS:
             raw = fetch_metar(station)
             if raw:
@@ -96,7 +97,7 @@ def poll_loop():
                 latest_metars[station] = {"raw": raw, "fetched_at": now}
                 socketio.emit("metar_update",
                     {"station": station, "raw": raw, "fetched_at": now, "changed": changed})
-                print(f"[POLL] {station}: {'CHANGED' if changed else 'same'}")
+                print(f"[POLL] {station}: {'NEW' if changed else 'same'}")
             eventlet.sleep(2)
 
 # ── Routes ────────────────────────────────────────────────────────────────────
@@ -107,7 +108,11 @@ def index():
 
 @app.route("/api/health")
 def health():
-    return jsonify({"ok": True, "stations": list(latest_metars.keys()), "ts": int(time.time())})
+    return jsonify({
+        "ok": True,
+        "stations_loaded": list(latest_metars.keys()),
+        "ts": int(time.time())
+    })
 
 @app.route("/api/latest")
 def api_latest():
@@ -125,22 +130,13 @@ def api_history(station):
     limit = min(int(request.args.get("limit", 50)), 200)
     return jsonify(get_history(station.upper(), limit))
 
-# ── Bootstrap (runs once when module is first imported by any server) ─────────
-
-def bootstrap():
-    global _started
-    if _started:
-        return
-    _started = True
-    init_db()
-    socketio.start_background_task(poll_loop)
-    print("[BOOT] DB ready, poll task started.")
-
-bootstrap()
-
-# ── Dev runner ────────────────────────────────────────────────────────────────
+# ── Main ─────────────────────────────────────────────────────────────────────
+# init_db and poll_loop are called from start.py, not here,
+# so this file is safe to import without side effects.
 
 if __name__ == "__main__":
+    init_db()
+    socketio.start_background_task(poll_loop)
     port = int(os.environ.get("PORT", 5000))
     print(f"[MAIN] Listening on 0.0.0.0:{port}")
     socketio.run(app, host="0.0.0.0", port=port, log_output=True)
