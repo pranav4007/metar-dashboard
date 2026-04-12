@@ -2,10 +2,10 @@ import eventlet
 eventlet.monkey_patch()
 
 import os, time, sqlite3
+import requests as req_lib
 from flask import Flask, jsonify, render_template, request
 from flask_socketio import SocketIO
 from flask_cors import CORS
-import avwx
 
 app = Flask(__name__, static_folder="static", template_folder="templates")
 app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "metar-secret-key")
@@ -48,64 +48,85 @@ def get_history(station, limit=50):
     conn.close()
     return [{"raw": r[0], "fetched_at": r[1]} for r in rows]
 
-# ── METAR ─────────────────────────────────────────────────────────────────────
+# ── METAR fetch — NOAA public API, no key needed ──────────────────────────────
+# Primary:  https://aviationweather.gov/api/data/metar
+# Fallback: https://tgftp.nws.noaa.gov/data/observations/metar/stations/
 
-def fetch_one(station):
+def fetch_metar(station):
+    # --- Primary: NOAA API ---
     try:
-        m = avwx.Metar(station)
-        m.update()
-        raw = m.raw
-        if raw:
-            now = int(time.time())
-            save_metar(station, raw, now)
-            latest_metars[station] = {"raw": raw, "fetched_at": now}
-            socketio.emit("metar_update", {
-                "station": station, "raw": raw, "fetched_at": now,
-                "changed": True
-            })
-            print(f"[FETCH] {station}: {raw[:60]}", flush=True)
-        return raw
+        url = f"https://aviationweather.gov/api/data/metar?ids={station}&format=raw&hours=3"
+        r = req_lib.get(url, timeout=15)
+        r.raise_for_status()
+        text = r.text.strip()
+        if text:
+            for line in text.splitlines():
+                line = line.strip()
+                if line.startswith(station):
+                    print(f"[NOAA-API] {station}: {line[:70]}", flush=True)
+                    return line
+            # if station id not in response, still return first non-empty line
+            first = next((l.strip() for l in text.splitlines() if l.strip()), None)
+            if first:
+                print(f"[NOAA-API] {station} (raw): {first[:70]}", flush=True)
+                return first
     except Exception as e:
-        print(f"[ERROR] {station}: {e}", flush=True)
-        return None
+        print(f"[NOAA-API] {station} failed: {e}", flush=True)
+
+    # --- Fallback: NOAA text file ---
+    try:
+        url2 = f"https://tgftp.nws.noaa.gov/data/observations/metar/stations/{station}.TXT"
+        r2 = req_lib.get(url2, timeout=15)
+        r2.raise_for_status()
+        lines = r2.text.strip().splitlines()
+        # File format: first line = datetime, second = raw METAR
+        for line in lines:
+            line = line.strip()
+            if line.startswith(station):
+                print(f"[NOAA-TXT] {station}: {line[:70]}", flush=True)
+                return line
+    except Exception as e:
+        print(f"[NOAA-TXT] {station} failed: {e}", flush=True)
+
+    print(f"[ERROR] {station}: all sources failed", flush=True)
+    return None
+
+def fetch_and_emit(station):
+    raw = fetch_metar(station)
+    if raw:
+        now = int(time.time())
+        changed = save_metar(station, raw, now)
+        latest_metars[station] = {"raw": raw, "fetched_at": now}
+        socketio.emit("metar_update", {
+            "station": station, "raw": raw,
+            "fetched_at": now, "changed": changed
+        })
+        return True
+    return False
 
 def poll_loop():
-    # Initial fetch — one station at a time, emit as each comes in
-    print("[POLL] Initial fetch...", flush=True)
+    print("[POLL] Initial fetch starting...", flush=True)
     for s in STATIONS:
-        fetch_one(s)
+        fetch_and_emit(s)
         eventlet.sleep(1)
-    print("[POLL] Initial complete.", flush=True)
+    print("[POLL] Initial fetch complete.", flush=True)
 
-    # Continuous loop
     while True:
         eventlet.sleep(POLL_INTERVAL)
         print("[POLL] Refresh cycle...", flush=True)
         for s in STATIONS:
-            try:
-                m = avwx.Metar(s)
-                m.update()
-                raw = m.raw
-                if raw:
-                    now = int(time.time())
-                    changed = save_metar(s, raw, now)
-                    latest_metars[s] = {"raw": raw, "fetched_at": now}
-                    socketio.emit("metar_update", {
-                        "station": s, "raw": raw, "fetched_at": now, "changed": changed
-                    })
-                    print(f"[POLL] {s}: {'NEW' if changed else 'same'}", flush=True)
-            except Exception as e:
-                print(f"[ERROR] {s}: {e}", flush=True)
-            eventlet.sleep(2)
+            fetch_and_emit(s)
+            eventlet.sleep(1)
 
-# ── WebSocket — push all current data to newly connected client ───────────────
+# ── WebSocket — push snapshot to newly connected client ───────────────────────
 
 @socketio.on("connect")
 def on_connect():
-    print(f"[WS] Client connected, pushing {len(latest_metars)} stations", flush=True)
+    print(f"[WS] Client connected. Have {len(latest_metars)} stations cached.", flush=True)
     for s, d in latest_metars.items():
         socketio.emit("metar_update", {
-            "station": s, "raw": d["raw"], "fetched_at": d["fetched_at"], "changed": False
+            "station": s, "raw": d["raw"],
+            "fetched_at": d["fetched_at"], "changed": False
         }, to=request.sid)
 
 # ── Routes ────────────────────────────────────────────────────────────────────
@@ -132,12 +153,22 @@ def api_history(station):
     limit = min(int(request.args.get("limit", 50)), 200)
     return jsonify(get_history(station.upper(), limit))
 
+# Manual refresh trigger — hit /api/refresh in browser to force immediate fetch
+@app.route("/api/refresh")
+def api_refresh():
+    def do_refresh():
+        for s in STATIONS:
+            fetch_and_emit(s)
+            eventlet.sleep(0.5)
+    socketio.start_background_task(do_refresh)
+    return jsonify({"ok": True, "msg": "Refresh triggered"})
+
 # ── Boot ──────────────────────────────────────────────────────────────────────
 
-print("[BOOT] Starting up...", flush=True)
+print("[BOOT] Starting...", flush=True)
 init_db()
 socketio.start_background_task(poll_loop)
-print("[BOOT] Poll task started.", flush=True)
+print("[BOOT] Poll task queued.", flush=True)
 
 port = int(os.environ.get("PORT", 10000))
 socketio.run(app, host="0.0.0.0", port=port, log_output=True)
