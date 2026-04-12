@@ -2,6 +2,7 @@ import eventlet
 eventlet.monkey_patch()
 
 import os, time, sqlite3
+from concurrent.futures import ThreadPoolExecutor
 import avwx
 from flask import Flask, jsonify, render_template, request
 from flask_socketio import SocketIO
@@ -16,6 +17,7 @@ STATIONS      = ["VIAH", "VIDP", "VIBY", "VIAG", "VIND"]
 DB_PATH       = os.environ.get("DB_PATH", "/tmp/metar_history.db")
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "300"))
 latest_metars = {}
+executor      = ThreadPoolExecutor(max_workers=5)
 
 # ── DB ────────────────────────────────────────────────────────────────────────
 
@@ -48,44 +50,38 @@ def get_history(station, limit=50):
     conn.close()
     return [{"raw": r[0], "fetched_at": r[1]} for r in rows]
 
-# ── METAR — your exact working approach, run in thread pool so it never blocks ─
+# ── METAR — your exact working approach ──────────────────────────────────────
 
-def _avwx_fetch_blocking(station):
-    """Runs in a real OS thread via tpool. Exactly your terminal script."""
+def _avwx_fetch(station):
+    """Exact copy of your working terminal script. Runs in a real thread."""
     metar = avwx.Metar(station)
     metar.update()
+    print(f"[FETCH] {station} RAW: {metar.raw}", flush=True)
     return metar.raw
 
-def fetch_metar(station):
-    """Called from eventlet greenlet — offloads blocking avwx call to thread."""
+def fetch_and_emit(station):
+    """Submit avwx fetch to thread pool, wait for result, then emit."""
     try:
-        # tpool.execute runs the function in a real thread,
-        # yields control back to eventlet while waiting
-        raw = eventlet.tpool.execute(_avwx_fetch_blocking, station)
-        print(f"[FETCH] {station} RAW: {raw}", flush=True)
-        return raw
+        future = executor.submit(_avwx_fetch, station)
+        raw = future.result(timeout=30)   # wait up to 30s
+        if raw:
+            now = int(time.time())
+            changed = save_metar(station, raw, now)
+            latest_metars[station] = {"raw": raw, "fetched_at": now}
+            socketio.emit("metar_update", {
+                "station": station, "raw": raw,
+                "fetched_at": now, "changed": changed
+            })
+            return True
     except Exception as e:
         print(f"[ERROR] {station}: {e}", flush=True)
-        return None
-
-def fetch_and_emit(station):
-    raw = fetch_metar(station)
-    if raw:
-        now = int(time.time())
-        changed = save_metar(station, raw, now)
-        latest_metars[station] = {"raw": raw, "fetched_at": now}
-        socketio.emit("metar_update", {
-            "station": station, "raw": raw,
-            "fetched_at": now, "changed": changed
-        })
-        return True
     return False
 
 def poll_loop():
     print("[POLL] Initial fetch starting...", flush=True)
     for s in STATIONS:
         fetch_and_emit(s)
-        eventlet.sleep(1)
+        eventlet.sleep(0.5)
     print("[POLL] Initial fetch complete.", flush=True)
 
     while True:
@@ -93,13 +89,13 @@ def poll_loop():
         print("[POLL] Refresh cycle...", flush=True)
         for s in STATIONS:
             fetch_and_emit(s)
-            eventlet.sleep(1)
+            eventlet.sleep(0.5)
 
-# ── WebSocket — push snapshot to newly connected client ───────────────────────
+# ── WebSocket ─────────────────────────────────────────────────────────────────
 
 @socketio.on("connect")
 def on_connect():
-    print(f"[WS] Client connected. Have {len(latest_metars)} stations cached.", flush=True)
+    print(f"[WS] Client connected. Have {len(latest_metars)} stations.", flush=True)
     for s, d in latest_metars.items():
         socketio.emit("metar_update", {
             "station": s, "raw": d["raw"],
@@ -132,13 +128,12 @@ def api_history(station):
 
 @app.route("/api/refresh")
 def api_refresh():
-    """Hit this URL to force an immediate re-fetch of all stations."""
     def do_refresh():
         for s in STATIONS:
             fetch_and_emit(s)
-            eventlet.sleep(1)
+            eventlet.sleep(0.5)
     socketio.start_background_task(do_refresh)
-    return jsonify({"ok": True, "msg": "Refresh triggered for all stations"})
+    return jsonify({"ok": True, "msg": "Refresh triggered"})
 
 # ── Boot ──────────────────────────────────────────────────────────────────────
 
