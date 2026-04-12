@@ -6,9 +6,9 @@ services:
     startCommand: python app.py
     plan: free
     envVars:
-      - key: 71cad267b678677801d1499b3dd10f5e
+      - key: SECRET_KEY
         generateValue: true
       - key: POLL_INTERVAL
-        value: 500
+        value: 300
       - key: DB_PATH
         value: /tmp/metar_history.db
