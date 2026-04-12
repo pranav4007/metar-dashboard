@@ -2,7 +2,7 @@ import eventlet
 eventlet.monkey_patch()
 
 import os, time, sqlite3
-import requests as req_lib
+import avwx
 from flask import Flask, jsonify, render_template, request
 from flask_socketio import SocketIO
 from flask_cors import CORS
@@ -48,48 +48,25 @@ def get_history(station, limit=50):
     conn.close()
     return [{"raw": r[0], "fetched_at": r[1]} for r in rows]
 
-# ── METAR fetch — NOAA public API, no key needed ──────────────────────────────
-# Primary:  https://aviationweather.gov/api/data/metar
-# Fallback: https://tgftp.nws.noaa.gov/data/observations/metar/stations/
+# ── METAR — your exact working approach, run in thread pool so it never blocks ─
+
+def _avwx_fetch_blocking(station):
+    """Runs in a real OS thread via tpool. Exactly your terminal script."""
+    metar = avwx.Metar(station)
+    metar.update()
+    return metar.raw
 
 def fetch_metar(station):
-    # --- Primary: NOAA API ---
+    """Called from eventlet greenlet — offloads blocking avwx call to thread."""
     try:
-        url = f"https://aviationweather.gov/api/data/metar?ids={station}&format=raw&hours=3"
-        r = req_lib.get(url, timeout=15)
-        r.raise_for_status()
-        text = r.text.strip()
-        if text:
-            for line in text.splitlines():
-                line = line.strip()
-                if line.startswith(station):
-                    print(f"[NOAA-API] {station}: {line[:70]}", flush=True)
-                    return line
-            # if station id not in response, still return first non-empty line
-            first = next((l.strip() for l in text.splitlines() if l.strip()), None)
-            if first:
-                print(f"[NOAA-API] {station} (raw): {first[:70]}", flush=True)
-                return first
+        # tpool.execute runs the function in a real thread,
+        # yields control back to eventlet while waiting
+        raw = eventlet.tpool.execute(_avwx_fetch_blocking, station)
+        print(f"[FETCH] {station} RAW: {raw}", flush=True)
+        return raw
     except Exception as e:
-        print(f"[NOAA-API] {station} failed: {e}", flush=True)
-
-    # --- Fallback: NOAA text file ---
-    try:
-        url2 = f"https://tgftp.nws.noaa.gov/data/observations/metar/stations/{station}.TXT"
-        r2 = req_lib.get(url2, timeout=15)
-        r2.raise_for_status()
-        lines = r2.text.strip().splitlines()
-        # File format: first line = datetime, second = raw METAR
-        for line in lines:
-            line = line.strip()
-            if line.startswith(station):
-                print(f"[NOAA-TXT] {station}: {line[:70]}", flush=True)
-                return line
-    except Exception as e:
-        print(f"[NOAA-TXT] {station} failed: {e}", flush=True)
-
-    print(f"[ERROR] {station}: all sources failed", flush=True)
-    return None
+        print(f"[ERROR] {station}: {e}", flush=True)
+        return None
 
 def fetch_and_emit(station):
     raw = fetch_metar(station)
@@ -153,15 +130,15 @@ def api_history(station):
     limit = min(int(request.args.get("limit", 50)), 200)
     return jsonify(get_history(station.upper(), limit))
 
-# Manual refresh trigger — hit /api/refresh in browser to force immediate fetch
 @app.route("/api/refresh")
 def api_refresh():
+    """Hit this URL to force an immediate re-fetch of all stations."""
     def do_refresh():
         for s in STATIONS:
             fetch_and_emit(s)
-            eventlet.sleep(0.5)
+            eventlet.sleep(1)
     socketio.start_background_task(do_refresh)
-    return jsonify({"ok": True, "msg": "Refresh triggered"})
+    return jsonify({"ok": True, "msg": "Refresh triggered for all stations"})
 
 # ── Boot ──────────────────────────────────────────────────────────────────────
 
